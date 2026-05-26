@@ -4,7 +4,7 @@
  */
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "danmaku-proxy",
+  "name": "danmaku",
   "main": "src/index.js",
   "compatibility_date": "2026-05-26",
   "observability": {
