@@ -1,16 +1,15 @@
-import { getStore } from '@edgeone/pages-blob';
-
 // Global runtime settings for upstream proxying, caching and risk control.
 const CFG = {
   baseURL: 'https://api.dandanplay.net',
-  cacheName: 'cache',
   cacheTTL: 300,
-  blobName: 'blob',
   blobMax: 256,
   blobTTL: 86400,
   env: {
     appId: 'APP_ID',
     appSecret: 'APP_SECRET'
+  },
+  binding: {
+    cacheBucket: 'CACHE_BUCKET'
   },
   key: {
     riskIndex: 'risk-index.json',
@@ -27,10 +26,7 @@ const CFG = {
   }
 };
 
-// Blob store used as the second-level cache for large comment payloads.
-const blob = getStore(CFG.blobName);
-
-// Comment responses get an extra Blob-backed cache layer.
+// Comment responses get an extra R2-backed cache layer.
 const COMMENT = /^\/api\/v2\/comment\/[^/]+$/;
 
 // Only these upstream routes are allowed to be proxied.
@@ -41,68 +37,69 @@ const ALLOW = [
   { method: 'GET', re: COMMENT }
 ];
 
-/**
- * Handle all matched edge requests.
- * The flow is: validate route, run risk checks, try L1 cache, try L2 Blob cache,
- * fetch upstream, then write back caches.
- */
-export default async function onRequest(ctx) {
-  try {
-    const req = ctx.request;
-    const url = new URL(req.url);
-    const path = url.pathname;
-    if (!isAllowed(req.method, path.toLowerCase())) {
-      return fail(403, 'route_not_allowed');
-    }
-
-    const body = req.method === 'POST' ? await req.text() : '';
-    const bad = isMalicious(url, body);
-    const risk = await checkRisk(req, path, body, url.search, bad);
-    if (risk.blocked) {
-      return fail(risk.status, risk.code, { retryAfter: risk.retryAfter || 0 });
-    }
-
-    const cache = await caches.open(CFG.cacheName);
-    const cacheKey = await makeCacheKey(req.method, path, url.search, body);
-    const cacheReq = new Request(cacheKey, { method: 'GET' });
-    const commentKey = COMMENT.test(path.toLowerCase()) ? await getCommentKey(path, url.search) : '';
-
-    const l1 = await readCache(cache, cacheReq);
-    if (l1) {
-      return withCacheTag(l1, 'hit', 'l1');
-    }
-
-    if (commentKey) {
-      const l2 = await readBlobCache(commentKey);
-      if (l2) {
-        ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
-        return withCacheTag(l2, 'hit', 'l2');
+export default {
+  /**
+   * Handle all matched worker requests.
+   * The flow is: validate route, run risk checks, try L1 cache, try L2 R2 cache,
+   * fetch upstream, then write back caches.
+   */
+  async fetch(request, env, ctx) {
+    try {
+      const url = new URL(request.url);
+      const path = url.pathname;
+      if (!isAllowed(request.method, path.toLowerCase())) {
+        return fail(403, 'route_not_allowed');
       }
+
+      const body = request.method === 'POST' ? await request.text() : '';
+      const bad = isMalicious(url, body);
+      const risk = await checkRisk(env, request, path, body, url.search, bad);
+      if (risk.blocked) {
+        return fail(risk.status, risk.code, { retryAfter: risk.retryAfter || 0 });
+      }
+
+      const cache = caches.default;
+      const cacheKey = await makeCacheKey(request.method, url.origin, path, url.search, body);
+      const cacheReq = new Request(cacheKey, { method: 'GET' });
+      const commentKey = COMMENT.test(path.toLowerCase()) ? await getCommentKey(path, url.search) : '';
+
+      const l1 = await readCache(cache, cacheReq);
+      if (l1) {
+        return withCacheTag(l1, 'hit', 'l1');
+      }
+
+      if (commentKey) {
+        const l2 = await readBlobCache(env, commentKey);
+        if (l2) {
+          ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
+          return withCacheTag(l2, 'hit', 'l2');
+        }
+      }
+
+      const upstream = await proxy(request, path, url.search, body, env);
+      const text = await upstream.text();
+
+      if (!isJSON(text)) {
+        return fail(502, 'invalid_upstream_json');
+      }
+
+      const res = createJSONResponse(text, upstream.status);
+      if (!upstream.ok) {
+        return withCacheTag(res, 'bypass', 'origin');
+      }
+
+      ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
+
+      if (commentKey) {
+        ctx.waitUntil(writeBlobCache(env, commentKey, text));
+      }
+
+      return withCacheTag(res, 'miss', 'origin');
+    } catch (err) {
+      return fail(500, 'internal_error', { message: err.message || 'unknown_error' });
     }
-
-    const upstream = await proxy(req, path, url.search, body, ctx.env || {});
-    const text = await upstream.text();
-
-    if (!isJSON(text)) {
-      return fail(502, 'invalid_upstream_json');
-    }
-
-    const res = createJSONResponse(text, upstream.status);
-    if (!upstream.ok) {
-      return withCacheTag(res, 'bypass', 'origin');
-    }
-
-    ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
-
-    if (commentKey) {
-      ctx.waitUntil(writeBlobCache(commentKey, text));
-    }
-
-    return withCacheTag(res, 'miss', 'origin');
-  } catch (err) {
-    return fail(500, 'internal_error', { message: err.message || 'unknown_error' });
   }
-}
+};
 
 /**
  * Check whether the current request matches the allowlist.
@@ -149,14 +146,14 @@ async function sign(appId, ts, path, appSecret) {
 /**
  * Generate a stable cache key from method, path, query and POST body hash.
  */
-async function makeCacheKey(method, path, search, body) {
+async function makeCacheKey(method, origin, path, search, body) {
   const qs = new URLSearchParams(search);
   qs.set('_m', method);
   if (method === 'POST') {
     qs.set('_bh', await shaHex(body));
   }
   const query = qs.toString();
-  return `https://danmaku.edgeone.app${path}${query ? `?${query}` : ''}`;
+  return `${origin}${path}${query ? `?${query}` : ''}`;
 }
 
 /**
@@ -184,11 +181,11 @@ async function writeCache(cache, req, res) {
 }
 
 /**
- * Read the second-level Blob cache for comment payloads.
+ * Read the second-level R2 cache for comment payloads.
  */
-async function readBlobCache(commentKey) {
+async function readBlobCache(env, commentKey) {
   const nowTS = now();
-  let list = await readMetaJSON(CFG.key.commentIndex, []);
+  let list = await readMetaJSON(env, CFG.key.commentIndex, []);
   const hit = list.find((item) => item.k === commentKey);
 
   if (!hit) {
@@ -197,98 +194,116 @@ async function readBlobCache(commentKey) {
 
   if (hit.e <= nowTS) {
     list = list.filter((item) => item.k !== commentKey);
-    await Promise.all([blob.delete(blobKey(commentKey)), writeMetaJSON(CFG.key.commentIndex, list)]);
+    await Promise.all([deleteR2Objects(env, blobKey(commentKey)), writeMetaJSON(env, CFG.key.commentIndex, list)]);
     return null;
   }
 
-  const text = await blob.get(blobKey(commentKey));
+  const text = await readTextObject(env, blobKey(commentKey));
   if (!text) {
     list = list.filter((item) => item.k !== commentKey);
-    await writeMetaJSON(CFG.key.commentIndex, list);
+    await writeMetaJSON(env, CFG.key.commentIndex, list);
     return null;
   }
 
   hit.a = nowTS;
-  await writeMetaJSON(CFG.key.commentIndex, list);
+  await writeMetaJSON(env, CFG.key.commentIndex, list);
   return createJSONResponse(text, 200, CFG.cacheTTL);
 }
 
 /**
- * Persist the comment payload in Blob and maintain its Blob-based LRU metadata.
+ * Persist the comment payload in R2 and maintain its R2-based LRU metadata.
  */
-async function writeBlobCache(commentKey, text) {
+async function writeBlobCache(env, commentKey, text) {
   const nowTS = now();
-  let list = await readMetaJSON(CFG.key.commentIndex, []);
+  let list = await readMetaJSON(env, CFG.key.commentIndex, []);
   const expired = list.filter((item) => item.k !== commentKey && item.e <= nowTS);
 
-  await blob.set(blobKey(commentKey), text);
+  await writeTextObject(env, blobKey(commentKey), text);
 
   list = list.filter((item) => item.k !== commentKey && item.e > nowTS);
   list.push({ k: commentKey, a: nowTS, e: nowTS + CFG.blobTTL });
   list.sort((a, b) => a.a - b.a);
   const drop = list.splice(0, Math.max(0, list.length - CFG.blobMax));
 
-  await Promise.all([...expired.map((item) => blob.delete(blobKey(item.k))), ...drop.map((item) => blob.delete(blobKey(item.k)))]);
-  await writeMetaJSON(CFG.key.commentIndex, list);
+  await Promise.all([
+    deleteR2Objects(
+      env,
+      [...expired.map((item) => blobKey(item.k)), ...drop.map((item) => blobKey(item.k))].filter(Boolean)
+    ),
+    writeMetaJSON(env, CFG.key.commentIndex, list)
+  ]);
 }
 
 /**
- * Read a metadata JSON file from Blob with strong consistency.
+ * Read a metadata JSON file from R2.
  */
-async function readMetaJSON(key, fallback) {
-  const value = await blob.get(key, { type: 'json', consistency: 'strong' });
-  return value || fallback;
+async function readMetaJSON(env, key, fallback) {
+  const obj = await getBucket(env).get(key);
+  if (!obj) {
+    return fallback;
+  }
+
+  try {
+    return await obj.json();
+  } catch {
+    return fallback;
+  }
 }
 
 /**
- * Write a metadata JSON file into Blob.
+ * Write a metadata JSON file into R2.
  */
-function writeMetaJSON(key, value) {
-  return blob.setJSON(key, value);
+function writeMetaJSON(env, key, value) {
+  return getBucket(env).put(key, JSON.stringify(value), {
+    httpMetadata: {
+      contentType: 'application/json; charset=utf-8',
+      cacheControl: 'no-store'
+    }
+  });
 }
 
 /**
  * Remove expired risk state files and keep their index compact.
  */
-async function pruneRiskIndex(nowTS) {
-  let list = await readMetaJSON(CFG.key.riskIndex, []);
+async function pruneRiskIndex(env, nowTS) {
+  let list = await readMetaJSON(env, CFG.key.riskIndex, []);
   const expired = list.filter((item) => item.e <= nowTS);
   if (!expired.length) {
     return list;
   }
   list = list.filter((item) => item.e > nowTS);
-  await Promise.all([...expired.map((item) => blob.delete(item.k)), writeMetaJSON(CFG.key.riskIndex, list)]);
+  await Promise.all([deleteR2Objects(env, expired.map((item) => item.k)), writeMetaJSON(env, CFG.key.riskIndex, list)]);
   return list;
 }
 
 /**
  * Persist the current risk state and update its cleanup index.
  */
-async function writeRiskState(key, state, nowTS, list) {
+async function writeRiskState(env, key, state, nowTS, list) {
   if (!state.b && (!Array.isArray(state.h) || state.h.length === 0)) {
     const next = list.filter((item) => item.k !== key);
-    await Promise.all([blob.delete(key), writeMetaJSON(CFG.key.riskIndex, next)]);
+    await Promise.all([deleteR2Objects(env, key), writeMetaJSON(env, CFG.key.riskIndex, next)]);
     return;
   }
 
   const expiresAt = state.b > nowTS ? state.b : nowTS + CFG.risk.windowSec;
   const next = list.filter((item) => item.k !== key);
   next.push({ k: key, e: expiresAt });
-  await Promise.all([blob.setJSON(key, state), writeMetaJSON(CFG.key.riskIndex, next)]);
+  await Promise.all([writeMetaJSON(env, key, state), writeMetaJSON(env, CFG.key.riskIndex, next)]);
 }
 
 /**
  * Apply request size checks and per-fingerprint rate limiting.
  */
-async function checkRisk(req, path, body, search, bad) {
+async function checkRisk(env, req, path, body, search, bad) {
   if (body.length > CFG.risk.maxBodyBytes || search.length > CFG.risk.maxQueryBytes) {
     return { blocked: true, status: 400, code: 'request_too_large', retryAfter: 0 };
   }
 
   const key = riskKey(await shaHex(finger(req, path)));
   const nowTS = now();
-  const riskList = await pruneRiskIndex(nowTS);
-  const state = await readMetaJSON(key, { h: [], b: 0 });
+  const riskList = await pruneRiskIndex(env, nowTS);
+  const state = await readMetaJSON(env, key, { h: [], b: 0 });
 
   if (state.b > nowTS) {
     return {
@@ -302,7 +317,7 @@ async function checkRisk(req, path, body, search, bad) {
   const hits = Array.isArray(state.h) ? state.h.filter((item) => nowTS - item < CFG.risk.windowSec) : [];
 
   if (bad) {
-    await writeRiskState(key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
+    await writeRiskState(env, key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
     return {
       blocked: true,
       status: 403,
@@ -314,7 +329,7 @@ async function checkRisk(req, path, body, search, bad) {
   hits.push(nowTS);
 
   if (hits.length > CFG.risk.maxHits) {
-    await writeRiskState(key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
+    await writeRiskState(env, key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
     return {
       blocked: true,
       status: 429,
@@ -323,12 +338,12 @@ async function checkRisk(req, path, body, search, bad) {
     };
   }
 
-  await writeRiskState(key, { h: hits, b: 0 }, nowTS, riskList);
+  await writeRiskState(env, key, { h: hits, b: 0 }, nowTS, riskList);
   return { blocked: false };
 }
 
 /**
- * Build a lightweight client fingerprint for Blob-based rate limiting.
+ * Build a lightweight client fingerprint for R2-based rate limiting.
  */
 function finger(req, path) {
   const ip = pickIp(req);
@@ -338,15 +353,10 @@ function finger(req, path) {
 }
 
 /**
- * Pick the client IP from the official EdgeOne request field, then fall back to proxy headers.
+ * Pick the client IP from Cloudflare's request header, then fall back to proxy headers.
  */
 function pickIp(req) {
-  const raw =
-    req.eo?.clientIp ||
-    req.headers.get('x-forwarded-for') ||
-    req.headers.get('eo-client-ip') ||
-    req.headers.get('cf-connecting-ip') ||
-    'unknown';
+  const raw = req.headers.get('cf-connecting-ip') || req.headers.get('x-forwarded-for') || req.headers.get('eo-client-ip') || 'unknown';
   return raw.split(',')[0].trim();
 }
 
@@ -415,14 +425,14 @@ function fail(status, code, extra) {
 }
 
 /**
- * Build the Blob object key for a cached comment payload.
+ * Build the R2 object key for a cached comment payload.
  */
 function blobKey(commentKey) {
   return `${CFG.key.commentPrefix}${commentKey}.json`;
 }
 
 /**
- * Build the Blob key for a per-fingerprint risk state file.
+ * Build the R2 key for a per-fingerprint risk state file.
  */
 function riskKey(fingerprint) {
   return `${CFG.key.riskPrefix}${fingerprint}.json`;
@@ -455,6 +465,48 @@ function requireEnv(env, key) {
     throw new Error(`Missing env: ${key}`);
   }
   return val;
+}
+
+/**
+ * Return the configured R2 bucket binding.
+ */
+function getBucket(env) {
+  const bucket = env[CFG.binding.cacheBucket];
+  if (!bucket) {
+    throw new Error(`Missing binding: ${CFG.binding.cacheBucket}`);
+  }
+  return bucket;
+}
+
+/**
+ * Read a text object from R2.
+ */
+async function readTextObject(env, key) {
+  const obj = await getBucket(env).get(key);
+  return obj ? obj.text() : null;
+}
+
+/**
+ * Write a text object to R2.
+ */
+function writeTextObject(env, key, text) {
+  return getBucket(env).put(key, text, {
+    httpMetadata: {
+      contentType: 'application/json; charset=utf-8',
+      cacheControl: `max-age=${CFG.blobTTL}`
+    }
+  });
+}
+
+/**
+ * Delete one or more objects from R2.
+ */
+async function deleteR2Objects(env, keys) {
+  const list = Array.isArray(keys) ? keys.filter(Boolean) : [keys].filter(Boolean);
+  if (!list.length) {
+    return;
+  }
+  await getBucket(env).delete(list);
 }
 
 /**

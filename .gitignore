@@ -42,6 +42,8 @@ next-env.d.ts
 
 .edgeone
 .DS_Store
+.wrangler
+.dev.vars*
 
 # Tencent Cloud EdgeOne
 .env

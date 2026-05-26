@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "danmaku-proxy",
+  "main": "src/index.js",
+  "compatibility_date": "2026-05-26",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "r2_buckets": [
+    {
+      "binding": "CACHE_BUCKET",
+      "bucket_name": "danmaku-proxy-cache",
+      "preview_bucket_name": "danmaku-proxy-cache-preview"
+    }
+  ],
+  "secrets": {
+    "required": ["APP_ID", "APP_SECRET"]
+  }
+}
