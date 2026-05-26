@@ -3,14 +3,19 @@ import { getStore } from '@edgeone/pages-blob';
 // Global runtime settings for upstream proxying, caching and risk control.
 const CFG = {
   baseURL: 'https://api.dandanplay.net',
-  cacheName: 'danmaku_proxy_l1',
+  cacheName: 'cache',
   cacheTTL: 300,
-  blobName: 'danmaku_proxy_l2',
+  blobName: 'blob',
   blobMax: 256,
   blobTTL: 86400,
-  auth: {
+  env: {
     appId: 'APP_ID',
     appSecret: 'APP_SECRET'
+  },
+  key: {
+    blobIndex: 'blob-index.json',
+    riskPrefix: 'risk/',
+    commentPrefix: 'comment/'
   },
   risk: {
     windowSec: 60,
@@ -18,11 +23,6 @@ const CFG = {
     banSec: 600,
     maxBodyBytes: 65536,
     maxQueryBytes: 4096
-  },
-  key: {
-    blobIndex: 'meta/blob-index.json',
-    riskPrefix: 'meta/risk/',
-    commentPrefix: 'comment/'
   }
 };
 
@@ -114,8 +114,8 @@ function isAllowed(method, path) {
  * Forward the request to the upstream API with the required signed headers.
  */
 async function proxy(req, path, search, body, env) {
-  const appId = mustEnv(env, CFG.auth.appId);
-  const appSecret = mustEnv(env, CFG.auth.appSecret);
+  const appId = mustEnv(env, CFG.env.appId);
+  const appSecret = mustEnv(env, CFG.env.appSecret);
   const ts = String(now());
   const sig = await sign(appId, ts, path, appSecret);
   const headers = new Headers();
@@ -197,10 +197,7 @@ async function readBlobCache(cacheKey) {
 
   if (hit.e <= nowTS) {
     list = list.filter((item) => item.k !== key);
-    await Promise.all([
-      blob.delete(blobKey(key)),
-      writeMetaJSON(CFG.key.blobIndex, list)
-    ]);
+    await Promise.all([blob.delete(blobKey(key)), writeMetaJSON(CFG.key.blobIndex, list)]);
     return null;
   }
 
@@ -256,9 +253,7 @@ async function checkRisk(req, path, body, search, bad) {
     };
   }
 
-  const hits = Array.isArray(state.h)
-    ? state.h.filter((item) => nowTS - item < CFG.risk.windowSec)
-    : [];
+  const hits = Array.isArray(state.h) ? state.h.filter((item) => nowTS - item < CFG.risk.windowSec) : [];
 
   if (bad) {
     await writeMetaJSON(key, { h: [], b: nowTS + CFG.risk.banSec });
@@ -308,10 +303,8 @@ function isMalicious(requestURL, body) {
  * Pick the most likely client IP from common proxy headers.
  */
 function pickIp(headers) {
-  const raw = headers.get('x-forwarded-for')
-    || headers.get('eo-client-ip')
-    || headers.get('cf-connecting-ip')
-    || 'unknown';
+  const raw =
+    headers.get('x-forwarded-for') || headers.get('eo-client-ip') || headers.get('cf-connecting-ip') || 'unknown';
   return raw.split(',')[0].trim();
 }
 
