@@ -29,16 +29,16 @@ const CFG = {
 // Blob store used as the second-level cache for large comment payloads.
 const blob = getStore(CFG.blobName);
 
+// Comment responses get an extra Blob-backed cache layer.
+const COMMENT_RE = /^\/api\/v2\/comment\/[^/]+$/;
+
 // Only these upstream routes are allowed to be proxied.
 const ALLOW = [
   { method: 'POST', re: /^\/api\/v2\/match$/ },
   { method: 'GET', re: /^\/api\/v2\/search\/episodes$/ },
   { method: 'GET', re: /^\/api\/v2\/bangumi\/[^/]+$/ },
-  { method: 'GET', re: /^\/api\/v2\/comment\/[^/]+$/ }
+  { method: 'GET', re: COMMENT_RE }
 ];
-
-// Comment responses get an extra Blob-backed cache layer.
-const COMMENT_RE = /^\/api\/v2\/comment\/[^/]+$/;
 
 /**
  * Handle all matched edge requests.
@@ -48,53 +48,53 @@ const COMMENT_RE = /^\/api\/v2\/comment\/[^/]+$/;
 export default async function onRequest(ctx) {
   try {
     const req = ctx.request;
-    const requestURL = new URL(req.url);
-    const path = requestURL.pathname.toLowerCase();
-    const body = req.method === 'POST' ? await req.text() : '';
-    const bad = isMalicious(requestURL, body);
-
+    const url = new URL(req.url);
+    const path = url.pathname.toLowerCase();
     if (!isAllowed(req.method, path)) {
       return fail(403, 'route_not_allowed');
     }
 
-    const risk = await checkRisk(req, path, body, requestURL.search, bad);
+    const body = req.method === 'POST' ? await req.text() : '';
+    const bad = isMalicious(url, body);
+    const risk = await checkRisk(req, path, body, url.search, bad);
     if (risk.blocked) {
       return fail(risk.status, risk.code, { retryAfter: risk.retryAfter || 0 });
     }
 
     const cache = await caches.open(CFG.cacheName);
-    const cacheKey = await makeCacheKey(req.method, path, requestURL.search, body);
+    const cacheKey = await makeCacheKey(req.method, path, url.search, body);
     const cacheReq = new Request(cacheKey, { method: 'GET' });
+    const commentId = COMMENT_RE.test(path) ? getCommentId(path) : '';
 
     const l1 = await readCache(cache, cacheReq);
     if (l1) {
       return tag(l1, 'hit', 'l1');
     }
 
-    if (COMMENT_RE.test(path)) {
-      const l2 = await readBlobCache(cacheKey);
+    if (commentId) {
+      const l2 = await readBlobCache(commentId);
       if (l2) {
         ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
         return tag(l2, 'hit', 'l2');
       }
     }
 
-    const up = await proxy(req, path, requestURL.search, body, ctx.env || {});
-    const text = await up.text();
+    const upstream = await proxy(req, path, url.search, body, ctx.env || {});
+    const text = await upstream.text();
 
     if (!isJSON(text)) {
       return fail(502, 'invalid_upstream_json');
     }
 
-    const res = makeJSON(text, up.status);
-    if (!up.ok) {
+    const res = makeJSON(text, upstream.status);
+    if (!upstream.ok) {
       return tag(res, 'bypass', 'origin');
     }
 
     ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
 
-    if (COMMENT_RE.test(path)) {
-      ctx.waitUntil(writeBlobCache(cacheKey, text));
+    if (commentId) {
+      ctx.waitUntil(writeBlobCache(commentId, text));
     }
 
     return tag(res, 'miss', 'origin');
@@ -141,7 +141,7 @@ async function proxy(req, path, search, body, env) {
  */
 async function sign(appId, ts, path, appSecret) {
   const data = `${appId}${ts}${path}${appSecret}`;
-  const hash = await crypto.subtle.digest('SHA-256', enc(data));
+  const hash = await crypto.subtle.digest('SHA-256', encode(data));
   return toBase64(hash);
 }
 
@@ -185,25 +185,24 @@ async function writeCache(cache, req, res) {
 /**
  * Read the second-level Blob cache for comment payloads.
  */
-async function readBlobCache(cacheKey) {
-  const key = await shaHex(cacheKey);
+async function readBlobCache(commentId) {
   const nowTS = now();
   let list = await readMetaJSON(CFG.key.blobIndex, []);
-  const hit = list.find((item) => item.k === key);
+  const hit = list.find((item) => item.k === commentId);
 
   if (!hit) {
     return null;
   }
 
   if (hit.e <= nowTS) {
-    list = list.filter((item) => item.k !== key);
-    await Promise.all([blob.delete(blobKey(key)), writeMetaJSON(CFG.key.blobIndex, list)]);
+    list = list.filter((item) => item.k !== commentId);
+    await Promise.all([blob.delete(blobKey(commentId)), writeMetaJSON(CFG.key.blobIndex, list)]);
     return null;
   }
 
-  const text = await blob.get(blobKey(key));
+  const text = await blob.get(blobKey(commentId));
   if (!text) {
-    list = list.filter((item) => item.k !== key);
+    list = list.filter((item) => item.k !== commentId);
     await writeMetaJSON(CFG.key.blobIndex, list);
     return null;
   }
@@ -216,15 +215,14 @@ async function readBlobCache(cacheKey) {
 /**
  * Persist the comment payload in Blob and maintain its Blob-based LRU metadata.
  */
-async function writeBlobCache(cacheKey, text) {
-  const key = await shaHex(cacheKey);
+async function writeBlobCache(commentId, text) {
   const nowTS = now();
   let list = await readMetaJSON(CFG.key.blobIndex, []);
 
-  await blob.set(blobKey(key), text);
+  await blob.set(blobKey(commentId), text);
 
-  list = list.filter((item) => item.k !== key && item.e > nowTS);
-  list.push({ k: key, a: nowTS, e: nowTS + CFG.blobTTL });
+  list = list.filter((item) => item.k !== commentId && item.e > nowTS);
+  list.push({ k: commentId, a: nowTS, e: nowTS + CFG.blobTTL });
   list.sort((a, b) => a.a - b.a);
   const drop = list.splice(0, Math.max(0, list.length - CFG.blobMax));
 
@@ -285,7 +283,7 @@ async function checkRisk(req, path, body, search, bad) {
  * Build a lightweight client fingerprint for KV-based rate limiting.
  */
 async function finger(req, path) {
-  const ip = pickIp(req.headers);
+  const ip = pickIp(req);
   const ua = req.headers.get('user-agent') || '';
   const lang = req.headers.get('accept-language') || '';
   return `${ip}|${ua}|${lang}|${path}`;
@@ -300,11 +298,15 @@ function isMalicious(requestURL, body) {
 }
 
 /**
- * Pick the most likely client IP from common proxy headers.
+ * Pick the client IP from the official EdgeOne request field, then fall back to proxy headers.
  */
-function pickIp(headers) {
+function pickIp(req) {
   const raw =
-    headers.get('x-forwarded-for') || headers.get('eo-client-ip') || headers.get('cf-connecting-ip') || 'unknown';
+    req.eo?.clientIp ||
+    req.headers.get('x-forwarded-for') ||
+    req.headers.get('eo-client-ip') ||
+    req.headers.get('cf-connecting-ip') ||
+    'unknown';
   return raw.split(',')[0].trim();
 }
 
@@ -365,6 +367,20 @@ async function writeMetaJSON(key, value) {
 }
 
 /**
+ * Build the Blob object key for a cached comment payload.
+ */
+function blobKey(key) {
+  return `${CFG.key.commentPrefix}${key}.json`;
+}
+
+/**
+ * Extract the episode id from /api/v2/comment/{id}.
+ */
+function getCommentId(path) {
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+/**
  * Build the Blob key for a per-fingerprint risk state file.
  */
 function riskKey(fingerprint) {
@@ -386,15 +402,8 @@ function mustEnv(env, key) {
  * Hash text into a SHA-256 hex string.
  */
 async function shaHex(text) {
-  const hash = await crypto.subtle.digest('SHA-256', enc(text));
+  const hash = await crypto.subtle.digest('SHA-256', encode(text));
   return toHex(hash);
-}
-
-/**
- * Build the Blob object key for a cached comment payload.
- */
-function blobKey(key) {
-  return `${CFG.key.commentPrefix}${key}.json`;
 }
 
 /**
@@ -415,7 +424,7 @@ function isJSON(text) {
 /**
  * Encode text into UTF-8 bytes.
  */
-function enc(text) {
+function encode(text) {
   return new TextEncoder().encode(text);
 }
 
