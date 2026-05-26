@@ -2,8 +2,6 @@
 const CFG = {
   baseURL: 'https://api.dandanplay.net',
   cacheTTL: 300,
-  blobMax: 256,
-  blobTTL: 86400,
   env: {
     appId: 'APP_ID',
     appSecret: 'APP_SECRET'
@@ -12,9 +10,7 @@ const CFG = {
     cacheBucket: 'CACHE_BUCKET'
   },
   key: {
-    riskIndex: 'risk-index.json',
     riskPrefix: 'risk/',
-    commentIndex: 'comment-index.json',
     commentPrefix: 'comment/'
   },
   risk: {
@@ -69,7 +65,7 @@ export default {
       }
 
       if (commentKey) {
-        const l2 = await readBlobCache(env, commentKey);
+        const l2 = await readBlobCacheSimple(env, commentKey);
         if (l2) {
           ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
           return withCacheTag(l2, 'hit', 'l2');
@@ -91,7 +87,7 @@ export default {
       ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
 
       if (commentKey) {
-        ctx.waitUntil(writeBlobCache(env, commentKey, text));
+        ctx.waitUntil(writeTextObject(env, blobKey(commentKey), text));
       }
 
       return withCacheTag(res, 'miss', 'origin');
@@ -180,116 +176,43 @@ async function writeCache(cache, req, res) {
   await cache.put(req, cached);
 }
 
+
 /**
- * Read the second-level R2 cache for comment payloads.
+ * Read the second-level R2 cache for comment payloads (simple version, no LRU, rely on R2 lifecycle for expiry).
  */
-async function readBlobCache(env, commentKey) {
-  const nowTS = now();
-  let list = await readMetaJSON(env, CFG.key.commentIndex, []);
-  const hit = list.find((item) => item.k === commentKey);
-
-  if (!hit) {
-    return null;
-  }
-
-  if (hit.e <= nowTS) {
-    list = list.filter((item) => item.k !== commentKey);
-    await Promise.all([deleteR2Objects(env, blobKey(commentKey)), writeMetaJSON(env, CFG.key.commentIndex, list)]);
-    return null;
-  }
-
+async function readBlobCacheSimple(env, commentKey) {
   const text = await readTextObject(env, blobKey(commentKey));
   if (!text) {
-    list = list.filter((item) => item.k !== commentKey);
-    await writeMetaJSON(env, CFG.key.commentIndex, list);
     return null;
   }
-
-  hit.a = nowTS;
-  await writeMetaJSON(env, CFG.key.commentIndex, list);
   return createJSONResponse(text, 200, CFG.cacheTTL);
 }
 
 /**
- * Persist the comment payload in R2 and maintain its R2-based LRU metadata.
+ * Read a risk state object from R2.
  */
-async function writeBlobCache(env, commentKey, text) {
-  const nowTS = now();
-  let list = await readMetaJSON(env, CFG.key.commentIndex, []);
-  const expired = list.filter((item) => item.k !== commentKey && item.e <= nowTS);
-
-  await writeTextObject(env, blobKey(commentKey), text);
-
-  list = list.filter((item) => item.k !== commentKey && item.e > nowTS);
-  list.push({ k: commentKey, a: nowTS, e: nowTS + CFG.blobTTL });
-  list.sort((a, b) => a.a - b.a);
-  const drop = list.splice(0, Math.max(0, list.length - CFG.blobMax));
-
-  await Promise.all([
-    deleteR2Objects(
-      env,
-      [...expired.map((item) => blobKey(item.k)), ...drop.map((item) => blobKey(item.k))].filter(Boolean)
-    ),
-    writeMetaJSON(env, CFG.key.commentIndex, list)
-  ]);
-}
-
-/**
- * Read a metadata JSON file from R2.
- */
-async function readMetaJSON(env, key, fallback) {
+async function readRiskState(env, key) {
   const obj = await getBucket(env).get(key);
   if (!obj) {
-    return fallback;
+    return { h: [], b: 0 };
   }
-
   try {
     return await obj.json();
   } catch {
-    return fallback;
+    return { h: [], b: 0 };
   }
 }
 
 /**
- * Write a metadata JSON file into R2.
+ * Write a risk state object to R2 (expired states are auto-deleted by R2 lifecycle).
  */
-function writeMetaJSON(env, key, value) {
-  return getBucket(env).put(key, JSON.stringify(value), {
+function writeRiskState(env, key, state) {
+  return getBucket(env).put(key, JSON.stringify(state), {
     httpMetadata: {
       contentType: 'application/json; charset=utf-8',
       cacheControl: 'no-store'
     }
   });
-}
-
-/**
- * Remove expired risk state files and keep their index compact.
- */
-async function pruneRiskIndex(env, nowTS) {
-  let list = await readMetaJSON(env, CFG.key.riskIndex, []);
-  const expired = list.filter((item) => item.e <= nowTS);
-  if (!expired.length) {
-    return list;
-  }
-  list = list.filter((item) => item.e > nowTS);
-  await Promise.all([deleteR2Objects(env, expired.map((item) => item.k)), writeMetaJSON(env, CFG.key.riskIndex, list)]);
-  return list;
-}
-
-/**
- * Persist the current risk state and update its cleanup index.
- */
-async function writeRiskState(env, key, state, nowTS, list) {
-  if (!state.b && (!Array.isArray(state.h) || state.h.length === 0)) {
-    const next = list.filter((item) => item.k !== key);
-    await Promise.all([deleteR2Objects(env, key), writeMetaJSON(env, CFG.key.riskIndex, next)]);
-    return;
-  }
-
-  const expiresAt = state.b > nowTS ? state.b : nowTS + CFG.risk.windowSec;
-  const next = list.filter((item) => item.k !== key);
-  next.push({ k: key, e: expiresAt });
-  await Promise.all([writeMetaJSON(env, key, state), writeMetaJSON(env, CFG.key.riskIndex, next)]);
 }
 
 /**
@@ -302,8 +225,7 @@ async function checkRisk(env, req, path, body, search, bad) {
 
   const key = riskKey(await shaHex(finger(req, path)));
   const nowTS = now();
-  const riskList = await pruneRiskIndex(env, nowTS);
-  const state = await readMetaJSON(env, key, { h: [], b: 0 });
+  const state = await readRiskState(env, key);
 
   if (state.b > nowTS) {
     return {
@@ -317,7 +239,7 @@ async function checkRisk(env, req, path, body, search, bad) {
   const hits = Array.isArray(state.h) ? state.h.filter((item) => nowTS - item < CFG.risk.windowSec) : [];
 
   if (bad) {
-    await writeRiskState(env, key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
+    await writeRiskState(env, key, { h: [], b: nowTS + CFG.risk.banSec });
     return {
       blocked: true,
       status: 403,
@@ -329,7 +251,7 @@ async function checkRisk(env, req, path, body, search, bad) {
   hits.push(nowTS);
 
   if (hits.length > CFG.risk.maxHits) {
-    await writeRiskState(env, key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
+    await writeRiskState(env, key, { h: [], b: nowTS + CFG.risk.banSec });
     return {
       blocked: true,
       status: 429,
@@ -338,7 +260,7 @@ async function checkRisk(env, req, path, body, search, bad) {
     };
   }
 
-  await writeRiskState(env, key, { h: hits, b: 0 }, nowTS, riskList);
+  await writeRiskState(env, key, { h: hits, b: 0 });
   return { blocked: false };
 }
 
@@ -493,7 +415,7 @@ function writeTextObject(env, key, text) {
   return getBucket(env).put(key, text, {
     httpMetadata: {
       contentType: 'application/json; charset=utf-8',
-      cacheControl: `max-age=${CFG.blobTTL}`
+      cacheControl: 'public, max-age=86400'
     }
   });
 }
