@@ -68,14 +68,14 @@ export default async function onRequest(ctx) {
 
     const l1 = await readCache(cache, cacheReq);
     if (l1) {
-      return tag(l1, 'hit', 'l1');
+      return withCacheTag(l1, 'hit', 'l1');
     }
 
     if (commentId) {
       const l2 = await readBlobCache(commentId);
       if (l2) {
         ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
-        return tag(l2, 'hit', 'l2');
+        return withCacheTag(l2, 'hit', 'l2');
       }
     }
 
@@ -86,9 +86,9 @@ export default async function onRequest(ctx) {
       return fail(502, 'invalid_upstream_json');
     }
 
-    const res = makeJSON(text, upstream.status);
+    const res = createJSONResponse(text, upstream.status);
     if (!upstream.ok) {
-      return tag(res, 'bypass', 'origin');
+      return withCacheTag(res, 'bypass', 'origin');
     }
 
     ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
@@ -97,7 +97,7 @@ export default async function onRequest(ctx) {
       ctx.waitUntil(writeBlobCache(commentId, text));
     }
 
-    return tag(res, 'miss', 'origin');
+    return withCacheTag(res, 'miss', 'origin');
   } catch (err) {
     return fail(500, 'internal_error', { message: err.message || 'unknown_error' });
   }
@@ -114,8 +114,8 @@ function isAllowed(method, path) {
  * Forward the request to the upstream API with the required signed headers.
  */
 async function proxy(req, path, search, body, env) {
-  const appId = mustEnv(env, CFG.env.appId);
-  const appSecret = mustEnv(env, CFG.env.appSecret);
+  const appId = requireEnv(env, CFG.env.appId);
+  const appSecret = requireEnv(env, CFG.env.appSecret);
   const ts = String(now());
   const sig = await sign(appId, ts, path, appSecret);
   const headers = new Headers();
@@ -209,7 +209,7 @@ async function readBlobCache(commentId) {
 
   hit.a = nowTS;
   await writeMetaJSON(CFG.key.blobIndex, list);
-  return makeJSON(text, 200, CFG.cacheTTL);
+  return createJSONResponse(text, 200, CFG.cacheTTL);
 }
 
 /**
@@ -313,7 +313,7 @@ function pickIp(req) {
 /**
  * Create a JSON response with cache headers.
  */
-function makeJSON(text, status, ttl) {
+function createJSONResponse(text, status, ttl) {
   const headers = new Headers({
     'Content-Type': 'application/json; charset=utf-8'
   });
@@ -328,7 +328,7 @@ function makeJSON(text, status, ttl) {
 /**
  * Add cache hit information to the outgoing response.
  */
-function tag(res, state, tier) {
+function withCacheTag(res, state, tier) {
   const headers = new Headers(res.headers);
   headers.set('X-Proxy-Cache', state);
   headers.set('X-Proxy-Cache-Tier', tier);
@@ -374,13 +374,6 @@ function blobKey(key) {
 }
 
 /**
- * Extract the episode id from /api/v2/comment/{id}.
- */
-function getCommentId(path) {
-  return path.slice(path.lastIndexOf('/') + 1);
-}
-
-/**
  * Build the Blob key for a per-fingerprint risk state file.
  */
 function riskKey(fingerprint) {
@@ -388,9 +381,16 @@ function riskKey(fingerprint) {
 }
 
 /**
+ * Extract the episode id from /api/v2/comment/{id}.
+ */
+function getCommentId(path) {
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+/**
  * Read a required environment variable.
  */
-function mustEnv(env, key) {
+function requireEnv(env, key) {
   const val = env[key];
   if (!val) {
     throw new Error(`Missing env: ${key}`);
