@@ -1,17 +1,15 @@
 // Global runtime settings for upstream proxying, caching and risk control.
 const CFG = {
   baseURL: 'https://api.dandanplay.net',
-  cacheTTL: 300,
   env: {
     appId: 'APP_ID',
     appSecret: 'APP_SECRET'
   },
-  binding: {
-    cacheBucket: 'CACHE_BUCKET'
-  },
-  key: {
-    riskPrefix: 'risk/',
-    commentPrefix: 'comment/'
+  cacheTTL: 3600,
+  bucket: 'STORAGE',
+  prefix: {
+    comment: 'comment/',
+    risk: 'risk/'
   },
   risk: {
     windowSec: 60,
@@ -65,7 +63,7 @@ export default {
       }
 
       if (commentKey) {
-        const l2 = await readBlobCacheSimple(env, commentKey);
+        const l2 = await readR2CommentCache(env, commentKey);
         if (l2) {
           ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
           return withCacheTag(l2, 'hit', 'l2');
@@ -87,7 +85,7 @@ export default {
       ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
 
       if (commentKey) {
-        ctx.waitUntil(writeTextObject(env, blobKey(commentKey), text));
+        ctx.waitUntil(writeR2Text(env, r2CommentKey(commentKey), text));
       }
 
       return withCacheTag(res, 'miss', 'origin');
@@ -176,12 +174,11 @@ async function writeCache(cache, req, res) {
   await cache.put(req, cached);
 }
 
-
 /**
  * Read the second-level R2 cache for comment payloads (simple version, no LRU, rely on R2 lifecycle for expiry).
  */
-async function readBlobCacheSimple(env, commentKey) {
-  const text = await readTextObject(env, blobKey(commentKey));
+async function readR2CommentCache(env, commentKey) {
+  const text = await readR2Text(env, r2CommentKey(commentKey));
   if (!text) {
     return null;
   }
@@ -192,7 +189,7 @@ async function readBlobCacheSimple(env, commentKey) {
  * Read a risk state object from R2.
  */
 async function readRiskState(env, key) {
-  const obj = await getBucket(env).get(key);
+  const obj = await getR2Bucket(env).get(key);
   if (!obj) {
     return { h: [], b: 0 };
   }
@@ -207,7 +204,7 @@ async function readRiskState(env, key) {
  * Write a risk state object to R2 (expired states are auto-deleted by R2 lifecycle).
  */
 function writeRiskState(env, key, state) {
-  return getBucket(env).put(key, JSON.stringify(state), {
+  return getR2Bucket(env).put(key, JSON.stringify(state), {
     httpMetadata: {
       contentType: 'application/json; charset=utf-8',
       cacheControl: 'no-store'
@@ -223,7 +220,7 @@ async function checkRisk(env, req, path, body, search, bad) {
     return { blocked: true, status: 400, code: 'request_too_large', retryAfter: 0 };
   }
 
-  const key = riskKey(await shaHex(finger(req, path)));
+  const key = r2RiskKey(await shaHex(finger(req, path)));
   const nowTS = now();
   const state = await readRiskState(env, key);
 
@@ -278,7 +275,11 @@ function finger(req, path) {
  * Pick the client IP from Cloudflare's request header, then fall back to proxy headers.
  */
 function pickIp(req) {
-  const raw = req.headers.get('cf-connecting-ip') || req.headers.get('x-forwarded-for') || req.headers.get('eo-client-ip') || 'unknown';
+  const raw =
+    req.headers.get('cf-connecting-ip') ||
+    req.headers.get('x-forwarded-for') ||
+    req.headers.get('eo-client-ip') ||
+    'unknown';
   return raw.split(',')[0].trim();
 }
 
@@ -349,15 +350,15 @@ function fail(status, code, extra) {
 /**
  * Build the R2 object key for a cached comment payload.
  */
-function blobKey(commentKey) {
-  return `${CFG.key.commentPrefix}${commentKey}.json`;
+function r2CommentKey(commentKey) {
+  return `${CFG.prefix.comment}${commentKey}.json`;
 }
 
 /**
  * Build the R2 key for a per-fingerprint risk state file.
  */
-function riskKey(fingerprint) {
-  return `${CFG.key.riskPrefix}${fingerprint}.json`;
+function r2RiskKey(fingerprint) {
+  return `${CFG.prefix.risk}${fingerprint}.json`;
 }
 
 /**
@@ -392,10 +393,10 @@ function requireEnv(env, key) {
 /**
  * Return the configured R2 bucket binding.
  */
-function getBucket(env) {
-  const bucket = env[CFG.binding.cacheBucket];
+function getR2Bucket(env) {
+  const bucket = env[CFG.bucket];
   if (!bucket) {
-    throw new Error(`Missing binding: ${CFG.binding.cacheBucket}`);
+    throw new Error(`Missing binding: ${CFG.bucket}`);
   }
   return bucket;
 }
@@ -403,16 +404,16 @@ function getBucket(env) {
 /**
  * Read a text object from R2.
  */
-async function readTextObject(env, key) {
-  const obj = await getBucket(env).get(key);
+async function readR2Text(env, key) {
+  const obj = await getR2Bucket(env).get(key);
   return obj ? obj.text() : null;
 }
 
 /**
  * Write a text object to R2.
  */
-function writeTextObject(env, key, text) {
-  return getBucket(env).put(key, text, {
+function writeR2Text(env, key, text) {
+  return getR2Bucket(env).put(key, text, {
     httpMetadata: {
       contentType: 'application/json; charset=utf-8',
       cacheControl: 'public, max-age=86400'
@@ -428,7 +429,7 @@ async function deleteR2Objects(env, keys) {
   if (!list.length) {
     return;
   }
-  await getBucket(env).delete(list);
+  await getR2Bucket(env).delete(list);
 }
 
 /**

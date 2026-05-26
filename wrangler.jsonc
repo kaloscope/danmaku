@@ -14,8 +14,8 @@
   "compatibility_flags": ["nodejs_compat"],
   "r2_buckets": [
     {
-      "binding": "CACHE_BUCKET",
-      "bucket_name": "danmaku-proxy-cache"
+      "binding": "STORAGE",
+      "bucket_name": "danmaku-proxy"
     }
   ],
   "secrets": {
