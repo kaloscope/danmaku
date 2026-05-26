@@ -53,7 +53,7 @@ export default {
       }
 
       const cache = caches.default;
-      const cacheKey = await cacheKey(request.method, url.origin, path, url.search, body);
+      const cacheKey = await makeCacheKey(request.method, url.origin, path, url.search, body);
       const cacheReq = new Request(cacheKey, { method: 'GET' });
       const commentKey = COMMENT.test(path.toLowerCase()) ? await getCommentKey(path, url.search) : '';
 
@@ -140,7 +140,7 @@ async function sign(appId, ts, path, appSecret) {
 /**
  * Generate a stable cache key from method, path, query and POST body hash.
  */
-async function cacheKey(method, origin, path, search, body) {
+async function makeCacheKey(method, origin, path, search, body) {
   const qs = new URLSearchParams(search);
   qs.set('_m', method);
   if (method === 'POST') {
