@@ -21,7 +21,8 @@ const CFG = {
   },
   key: {
     blobIndex: 'meta/blob-index.json',
-    riskPrefix: 'meta/risk/'
+    riskPrefix: 'meta/risk/',
+    commentPrefix: 'comment/'
   }
 };
 
@@ -400,7 +401,7 @@ async function shaHex(text) {
  * Build the Blob object key for a cached comment payload.
  */
 function blobKey(key) {
-  return `comment/${key}.json`;
+  return `${CFG.key.commentPrefix}${key}.json`;
 }
 
 /**
