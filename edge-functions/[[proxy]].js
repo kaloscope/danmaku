@@ -30,14 +30,14 @@ const CFG = {
 const blob = getStore(CFG.blobName);
 
 // Comment responses get an extra Blob-backed cache layer.
-const COMMENT_RE = /^\/api\/v2\/comment\/[^/]+$/;
+const COMMENT = /^\/api\/v2\/comment\/[^/]+$/;
 
 // Only these upstream routes are allowed to be proxied.
 const ALLOW = [
   { method: 'POST', re: /^\/api\/v2\/match$/ },
   { method: 'GET', re: /^\/api\/v2\/search\/episodes$/ },
   { method: 'GET', re: /^\/api\/v2\/bangumi\/[^/]+$/ },
-  { method: 'GET', re: COMMENT_RE }
+  { method: 'GET', re: COMMENT }
 ];
 
 /**
@@ -64,7 +64,7 @@ export default async function onRequest(ctx) {
     const cache = await caches.open(CFG.cacheName);
     const cacheKey = await makeCacheKey(req.method, path, url.search, body);
     const cacheReq = new Request(cacheKey, { method: 'GET' });
-    const commentId = COMMENT_RE.test(path) ? getCommentId(path) : '';
+    const commentId = COMMENT.test(path) ? getCommentId(path) : '';
 
     const l1 = await readCache(cache, cacheReq);
     if (l1) {
@@ -231,6 +231,21 @@ async function writeBlobCache(commentId, text) {
 }
 
 /**
+ * Read a metadata JSON file from Blob with strong consistency.
+ */
+async function readMetaJSON(key, fallback) {
+  const value = await blob.get(key, { type: 'json', consistency: 'strong' });
+  return value || fallback;
+}
+
+/**
+ * Write a metadata JSON file into Blob.
+ */
+async function writeMetaJSON(key, value) {
+  await blob.setJSON(key, value);
+}
+
+/**
  * Apply request size checks and per-fingerprint rate limiting.
  */
 async function checkRisk(req, path, body, search, bad) {
@@ -290,14 +305,6 @@ async function finger(req, path) {
 }
 
 /**
- * Detect obviously malicious payload patterns before proxying upstream.
- */
-function isMalicious(requestURL, body) {
-  const sample = `${requestURL.pathname}${requestURL.search}\n${body}`.toLowerCase();
-  return /(\.\.\/|%2e%2e|<script|union\s+select|sleep\(|benchmark\()/.test(sample);
-}
-
-/**
  * Pick the client IP from the official EdgeOne request field, then fall back to proxy headers.
  */
 function pickIp(req) {
@@ -309,6 +316,30 @@ function pickIp(req) {
     'unknown';
   return raw.split(',')[0].trim();
 }
+
+/**
+ * Detect obviously malicious payload patterns before proxying upstream.
+ */
+function isMalicious(requestURL, body) {
+  const sample = `${requestURL.pathname}${requestURL.search}\n${body}`.toLowerCase();
+  return /(\.\.\/|%2e%2e|<script|union\s+select|sleep\(|benchmark\()/.test(sample);
+}
+
+/**
+ * Validate that the upstream response body is JSON text.
+ */
+function isJSON(text) {
+  if (!text) {
+    return false;
+  }
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 
 /**
  * Create a JSON response with cache headers.
@@ -352,25 +383,10 @@ function fail(status, code, extra) {
 }
 
 /**
- * Read a metadata JSON file from Blob with strong consistency.
- */
-async function readMetaJSON(key, fallback) {
-  const value = await blob.get(key, { type: 'json', consistency: 'strong' });
-  return value || fallback;
-}
-
-/**
- * Write a metadata JSON file into Blob.
- */
-async function writeMetaJSON(key, value) {
-  await blob.setJSON(key, value);
-}
-
-/**
  * Build the Blob object key for a cached comment payload.
  */
-function blobKey(key) {
-  return `${CFG.key.commentPrefix}${key}.json`;
+function blobKey(commentId) {
+  return `${CFG.key.commentPrefix}${commentId}.json`;
 }
 
 /**
@@ -407,28 +423,6 @@ async function shaHex(text) {
 }
 
 /**
- * Validate that the upstream response body is JSON text.
- */
-function isJSON(text) {
-  if (!text) {
-    return false;
-  }
-  try {
-    JSON.parse(text);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Encode text into UTF-8 bytes.
- */
-function encode(text) {
-  return new TextEncoder().encode(text);
-}
-
-/**
  * Convert a binary hash into a hex string.
  */
 function toHex(buf) {
@@ -445,6 +439,13 @@ function toBase64(buf) {
     out += String.fromCharCode(item);
   }
   return btoa(out);
+}
+
+/**
+ * Encode text into UTF-8 bytes.
+ */
+function encode(text) {
+  return new TextEncoder().encode(text);
 }
 
 /**
