@@ -6,12 +6,8 @@ const CFG = {
   cacheName: 'danmaku_proxy_l1',
   cacheTTL: 300,
   blobName: 'danmaku_proxy_l2',
-  blobMax: 128,
+  blobMax: 256,
   blobTTL: 86400,
-  KV: {
-    risk: 'DANMAKU_PROXY_RISK_KV',
-    blob: 'DANMAKU_PROXY_BLOB_KV'
-  },
   auth: {
     appId: 'APP_ID',
     appSecret: 'APP_SECRET'
@@ -24,8 +20,8 @@ const CFG = {
     maxQueryBytes: 4096
   },
   key: {
-    risk: 'risk_',
-    blobIndex: 'blob_index'
+    blobIndex: 'meta/blob-index.json',
+    riskPrefix: 'meta/risk/'
   }
 };
 
@@ -60,7 +56,7 @@ export default async function onRequest(ctx) {
       return fail(403, 'route_not_allowed');
     }
 
-    const risk = await checkRisk(ctx, req, path, body, requestURL.search, bad);
+    const risk = await checkRisk(req, path, body, requestURL.search, bad);
     if (risk.blocked) {
       return fail(risk.status, risk.code, { retryAfter: risk.retryAfter || 0 });
     }
@@ -75,7 +71,7 @@ export default async function onRequest(ctx) {
     }
 
     if (COMMENT_RE.test(path)) {
-      const l2 = await readBlobCache(ctx, cacheKey);
+      const l2 = await readBlobCache(cacheKey);
       if (l2) {
         ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
         return tag(l2, 'hit', 'l2');
@@ -97,7 +93,7 @@ export default async function onRequest(ctx) {
     ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
 
     if (COMMENT_RE.test(path)) {
-      ctx.waitUntil(writeBlobCache(ctx, cacheKey, text));
+      ctx.waitUntil(writeBlobCache(cacheKey, text));
     }
 
     return tag(res, 'miss', 'origin');
@@ -188,11 +184,10 @@ async function writeCache(cache, req, res) {
 /**
  * Read the second-level Blob cache for comment payloads.
  */
-async function readBlobCache(ctx, cacheKey) {
-  const KV = needKV(ctx, CFG.KV.blob);
+async function readBlobCache(cacheKey) {
   const key = await shaHex(cacheKey);
   const nowTS = now();
-  let list = await readJSON(KV, CFG.key.blobIndex, []);
+  let list = await readMetaJSON(CFG.key.blobIndex, []);
   const hit = list.find((item) => item.k === key);
 
   if (!hit) {
@@ -203,7 +198,7 @@ async function readBlobCache(ctx, cacheKey) {
     list = list.filter((item) => item.k !== key);
     await Promise.all([
       blob.delete(blobKey(key)),
-      KV.put(CFG.key.blobIndex, JSON.stringify(list))
+      writeMetaJSON(CFG.key.blobIndex, list)
     ]);
     return null;
   }
@@ -211,23 +206,22 @@ async function readBlobCache(ctx, cacheKey) {
   const text = await blob.get(blobKey(key));
   if (!text) {
     list = list.filter((item) => item.k !== key);
-    await KV.put(CFG.key.blobIndex, JSON.stringify(list));
+    await writeMetaJSON(CFG.key.blobIndex, list);
     return null;
   }
 
   hit.a = nowTS;
-  await KV.put(CFG.key.blobIndex, JSON.stringify(list));
+  await writeMetaJSON(CFG.key.blobIndex, list);
   return makeJSON(text, 200, CFG.cacheTTL);
 }
 
 /**
- * Persist the comment payload in Blob and maintain its KV-based LRU metadata.
+ * Persist the comment payload in Blob and maintain its Blob-based LRU metadata.
  */
-async function writeBlobCache(ctx, cacheKey, text) {
-  const KV = needKV(ctx, CFG.KV.blob);
+async function writeBlobCache(cacheKey, text) {
   const key = await shaHex(cacheKey);
   const nowTS = now();
-  let list = await readJSON(KV, CFG.key.blobIndex, []);
+  let list = await readMetaJSON(CFG.key.blobIndex, []);
 
   await blob.set(blobKey(key), text);
 
@@ -237,21 +231,20 @@ async function writeBlobCache(ctx, cacheKey, text) {
   const drop = list.splice(0, Math.max(0, list.length - CFG.blobMax));
 
   await Promise.all(drop.map((item) => blob.delete(blobKey(item.k))));
-  await KV.put(CFG.key.blobIndex, JSON.stringify(list));
+  await writeMetaJSON(CFG.key.blobIndex, list);
 }
 
 /**
  * Apply request size checks and per-fingerprint rate limiting.
  */
-async function checkRisk(ctx, req, path, body, search, bad) {
+async function checkRisk(req, path, body, search, bad) {
   if (body.length > CFG.risk.maxBodyBytes || search.length > CFG.risk.maxQueryBytes) {
     return { blocked: true, status: 400, code: 'request_too_large', retryAfter: 0 };
   }
 
-  const KV = needKV(ctx, CFG.KV.risk);
-  const key = `${CFG.key.risk}${await shaHex(await finger(req, path))}`;
+  const key = riskKey(await finger(req, path));
   const nowTS = now();
-  const state = await readJSON(KV, key, { h: [], b: 0 });
+  const state = await readMetaJSON(key, { h: [], b: 0 });
 
   if (state.b > nowTS) {
     return {
@@ -267,7 +260,7 @@ async function checkRisk(ctx, req, path, body, search, bad) {
     : [];
 
   if (bad) {
-    await KV.put(key, JSON.stringify({ h: [], b: nowTS + CFG.risk.banSec }));
+    await writeMetaJSON(key, { h: [], b: nowTS + CFG.risk.banSec });
     return {
       blocked: true,
       status: 403,
@@ -279,7 +272,7 @@ async function checkRisk(ctx, req, path, body, search, bad) {
   hits.push(nowTS);
 
   if (hits.length > CFG.risk.maxHits) {
-    await KV.put(key, JSON.stringify({ h: [], b: nowTS + CFG.risk.banSec }));
+    await writeMetaJSON(key, { h: [], b: nowTS + CFG.risk.banSec });
     return {
       blocked: true,
       status: 429,
@@ -288,7 +281,7 @@ async function checkRisk(ctx, req, path, body, search, bad) {
     };
   }
 
-  await KV.put(key, JSON.stringify({ h: hits, b: 0 }));
+  await writeMetaJSON(key, { h: hits, b: 0 });
   return { blocked: false };
 }
 
@@ -363,14 +356,25 @@ function fail(status, code, extra) {
 }
 
 /**
- * Resolve a KV binding from the edge runtime.
+ * Read a metadata JSON file from Blob with strong consistency.
  */
-function needKV(ctx, name) {
-  const KV = (ctx.env && ctx.env[name]) || globalThis[name];
-  if (!KV) {
-    throw new Error(`Missing KV binding: ${name}`);
-  }
-  return KV;
+async function readMetaJSON(key, fallback) {
+  const value = await blob.get(key, { type: 'json', consistency: 'strong' });
+  return value || fallback;
+}
+
+/**
+ * Write a metadata JSON file into Blob.
+ */
+async function writeMetaJSON(key, value) {
+  await blob.setJSON(key, value);
+}
+
+/**
+ * Build the Blob key for a per-fingerprint risk state file.
+ */
+function riskKey(fingerprint) {
+  return `${CFG.key.riskPrefix}${fingerprint}.json`;
 }
 
 /**
@@ -382,14 +386,6 @@ function mustEnv(env, key) {
     throw new Error(`Missing env: ${key}`);
   }
   return val;
-}
-
-/**
- * Read and parse a JSON value from KV.
- */
-async function readJSON(KV, key, fallback) {
-  const val = await KV.get(key, { type: 'json' });
-  return val || fallback;
 }
 
 /**
