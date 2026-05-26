@@ -13,8 +13,9 @@ const CFG = {
     appSecret: 'APP_SECRET'
   },
   key: {
-    blobIndex: 'blob-index.json',
+    riskIndex: 'risk-index.json',
     riskPrefix: 'risk/',
+    commentIndex: 'comment-index.json',
     commentPrefix: 'comment/'
   },
   risk: {
@@ -49,8 +50,8 @@ export default async function onRequest(ctx) {
   try {
     const req = ctx.request;
     const url = new URL(req.url);
-    const path = url.pathname.toLowerCase();
-    if (!isAllowed(req.method, path)) {
+    const path = url.pathname;
+    if (!isAllowed(req.method, path.toLowerCase())) {
       return fail(403, 'route_not_allowed');
     }
 
@@ -64,7 +65,7 @@ export default async function onRequest(ctx) {
     const cache = await caches.open(CFG.cacheName);
     const cacheKey = await makeCacheKey(req.method, path, url.search, body);
     const cacheReq = new Request(cacheKey, { method: 'GET' });
-    const commentKey = COMMENT.test(path) ? await getCommentKey(path, url.search) : '';
+    const commentKey = COMMENT.test(path.toLowerCase()) ? await getCommentKey(path, url.search) : '';
 
     const l1 = await readCache(cache, cacheReq);
     if (l1) {
@@ -187,7 +188,7 @@ async function writeCache(cache, req, res) {
  */
 async function readBlobCache(commentKey) {
   const nowTS = now();
-  let list = await readMetaJSON(CFG.key.blobIndex, []);
+  let list = await readMetaJSON(CFG.key.commentIndex, []);
   const hit = list.find((item) => item.k === commentKey);
 
   if (!hit) {
@@ -196,19 +197,19 @@ async function readBlobCache(commentKey) {
 
   if (hit.e <= nowTS) {
     list = list.filter((item) => item.k !== commentKey);
-    await Promise.all([blob.delete(blobKey(commentKey)), writeMetaJSON(CFG.key.blobIndex, list)]);
+    await Promise.all([blob.delete(blobKey(commentKey)), writeMetaJSON(CFG.key.commentIndex, list)]);
     return null;
   }
 
   const text = await blob.get(blobKey(commentKey));
   if (!text) {
     list = list.filter((item) => item.k !== commentKey);
-    await writeMetaJSON(CFG.key.blobIndex, list);
+    await writeMetaJSON(CFG.key.commentIndex, list);
     return null;
   }
 
   hit.a = nowTS;
-  await writeMetaJSON(CFG.key.blobIndex, list);
+  await writeMetaJSON(CFG.key.commentIndex, list);
   return createJSONResponse(text, 200, CFG.cacheTTL);
 }
 
@@ -217,7 +218,8 @@ async function readBlobCache(commentKey) {
  */
 async function writeBlobCache(commentKey, text) {
   const nowTS = now();
-  let list = await readMetaJSON(CFG.key.blobIndex, []);
+  let list = await readMetaJSON(CFG.key.commentIndex, []);
+  const expired = list.filter((item) => item.k !== commentKey && item.e <= nowTS);
 
   await blob.set(blobKey(commentKey), text);
 
@@ -226,8 +228,8 @@ async function writeBlobCache(commentKey, text) {
   list.sort((a, b) => a.a - b.a);
   const drop = list.splice(0, Math.max(0, list.length - CFG.blobMax));
 
-  await Promise.all(drop.map((item) => blob.delete(blobKey(item.k))));
-  await writeMetaJSON(CFG.key.blobIndex, list);
+  await Promise.all([...expired.map((item) => blob.delete(blobKey(item.k))), ...drop.map((item) => blob.delete(blobKey(item.k)))]);
+  await writeMetaJSON(CFG.key.commentIndex, list);
 }
 
 /**
@@ -241,8 +243,38 @@ async function readMetaJSON(key, fallback) {
 /**
  * Write a metadata JSON file into Blob.
  */
-async function writeMetaJSON(key, value) {
-  await blob.setJSON(key, value);
+function writeMetaJSON(key, value) {
+  return blob.setJSON(key, value);
+}
+
+/**
+ * Remove expired risk state files and keep their index compact.
+ */
+async function pruneRiskIndex(nowTS) {
+  let list = await readMetaJSON(CFG.key.riskIndex, []);
+  const expired = list.filter((item) => item.e <= nowTS);
+  if (!expired.length) {
+    return list;
+  }
+  list = list.filter((item) => item.e > nowTS);
+  await Promise.all([...expired.map((item) => blob.delete(item.k)), writeMetaJSON(CFG.key.riskIndex, list)]);
+  return list;
+}
+
+/**
+ * Persist the current risk state and update its cleanup index.
+ */
+async function writeRiskState(key, state, nowTS, list) {
+  if (!state.b && (!Array.isArray(state.h) || state.h.length === 0)) {
+    const next = list.filter((item) => item.k !== key);
+    await Promise.all([blob.delete(key), writeMetaJSON(CFG.key.riskIndex, next)]);
+    return;
+  }
+
+  const expiresAt = state.b > nowTS ? state.b : nowTS + CFG.risk.windowSec;
+  const next = list.filter((item) => item.k !== key);
+  next.push({ k: key, e: expiresAt });
+  await Promise.all([blob.setJSON(key, state), writeMetaJSON(CFG.key.riskIndex, next)]);
 }
 
 /**
@@ -255,6 +287,7 @@ async function checkRisk(req, path, body, search, bad) {
 
   const key = riskKey(await shaHex(finger(req, path)));
   const nowTS = now();
+  const riskList = await pruneRiskIndex(nowTS);
   const state = await readMetaJSON(key, { h: [], b: 0 });
 
   if (state.b > nowTS) {
@@ -269,7 +302,7 @@ async function checkRisk(req, path, body, search, bad) {
   const hits = Array.isArray(state.h) ? state.h.filter((item) => nowTS - item < CFG.risk.windowSec) : [];
 
   if (bad) {
-    await writeMetaJSON(key, { h: [], b: nowTS + CFG.risk.banSec });
+    await writeRiskState(key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
     return {
       blocked: true,
       status: 403,
@@ -281,7 +314,7 @@ async function checkRisk(req, path, body, search, bad) {
   hits.push(nowTS);
 
   if (hits.length > CFG.risk.maxHits) {
-    await writeMetaJSON(key, { h: [], b: nowTS + CFG.risk.banSec });
+    await writeRiskState(key, { h: [], b: nowTS + CFG.risk.banSec }, nowTS, riskList);
     return {
       blocked: true,
       status: 429,
@@ -290,7 +323,7 @@ async function checkRisk(req, path, body, search, bad) {
     };
   }
 
-  await writeMetaJSON(key, { h: hits, b: 0 });
+  await writeRiskState(key, { h: hits, b: 0 }, nowTS, riskList);
   return { blocked: false };
 }
 
