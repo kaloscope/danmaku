@@ -4,14 +4,12 @@ import { getStore } from '@edgeone/pages-blob';
 const CFG = {
   baseURL: 'https://api.dandanplay.net',
   cacheName: 'danmaku_proxy_l1',
-  cacheMax: 256,
   cacheTTL: 300,
   blobName: 'danmaku_proxy_l2',
   blobMax: 128,
   blobTTL: 86400,
   KV: {
     risk: 'DANMAKU_PROXY_RISK_KV',
-    cache: 'DANMAKU_PROXY_CACHE_KV',
     blob: 'DANMAKU_PROXY_BLOB_KV'
   },
   auth: {
@@ -27,7 +25,6 @@ const CFG = {
   },
   key: {
     risk: 'risk_',
-    cacheIndex: 'cache_index',
     blobIndex: 'blob_index'
   }
 };
@@ -74,14 +71,13 @@ export default async function onRequest(ctx) {
 
     const l1 = await readCache(cache, cacheReq);
     if (l1) {
-      ctx.waitUntil(touchCacheIndex(ctx, cacheKey));
       return tag(l1, 'hit', 'l1');
     }
 
     if (COMMENT_RE.test(path)) {
       const l2 = await readBlobCache(ctx, cacheKey);
       if (l2) {
-        ctx.waitUntil(writeCache(ctx, cache, cacheReq, l2.clone(), cacheKey));
+        ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
         return tag(l2, 'hit', 'l2');
       }
     }
@@ -98,7 +94,7 @@ export default async function onRequest(ctx) {
       return tag(res, 'bypass', 'origin');
     }
 
-    ctx.waitUntil(writeCache(ctx, cache, cacheReq, res.clone(), cacheKey));
+    ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
 
     if (COMMENT_RE.test(path)) {
       ctx.waitUntil(writeBlobCache(ctx, cacheKey, text));
@@ -177,9 +173,9 @@ async function readCache(cache, req) {
 }
 
 /**
- * Write the response into the first-level cache and update its LRU index.
+ * Write the response into the first-level cache.
  */
-async function writeCache(ctx, cache, req, res, cacheKey) {
+async function writeCache(cache, req, res) {
   const headers = new Headers(res.headers);
   headers.set('Cache-Control', `s-maxage=${CFG.cacheTTL}`);
   const cached = new Response(await res.text(), {
@@ -187,23 +183,6 @@ async function writeCache(ctx, cache, req, res, cacheKey) {
     headers
   });
   await cache.put(req, cached);
-  await touchCacheIndex(ctx, cacheKey, cache);
-}
-
-/**
- * Keep a simple LRU list for first-level cache keys in KV.
- */
-async function touchCacheIndex(ctx, cacheKey, cache) {
-  const KV = needKV(ctx, CFG.KV.cache);
-  let list = await readJSON(KV, CFG.key.cacheIndex, []);
-  list = list.filter((item) => item.k !== cacheKey);
-  list.push({ k: cacheKey, a: now() });
-  list.sort((a, b) => a.a - b.a);
-  const drop = list.splice(0, Math.max(0, list.length - CFG.cacheMax));
-  if (cache) {
-    await Promise.all(drop.map((item) => cache.delete(item.k)));
-  }
-  await KV.put(CFG.key.cacheIndex, JSON.stringify(list));
 }
 
 /**
