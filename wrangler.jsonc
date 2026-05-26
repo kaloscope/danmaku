@@ -1,12 +1,17 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "danmaku-proxy",
   "main": "src/index.js",
   "compatibility_date": "2026-05-26",
-  "workers_dev": true,
   "observability": {
     "enabled": true
   },
+  "upload_source_maps": true,
+  "compatibility_flags": ["nodejs_compat"],
   "r2_buckets": [
     {
       "binding": "CACHE_BUCKET",

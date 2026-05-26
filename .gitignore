@@ -42,11 +42,16 @@ next-env.d.ts
 
 .edgeone
 .DS_Store
-.wrangler
-.dev.vars*
 
 # Tencent Cloud EdgeOne
 .env
 .edgeone/*
 !.edgeone/project.json
 .tef_dist/*
+
+# wrangler project
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+.wrangler/
