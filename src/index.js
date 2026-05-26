@@ -53,7 +53,7 @@ export default {
       }
 
       const cache = caches.default;
-      const cacheKey = await makeCacheKey(request.method, url.origin, path, url.search, body);
+      const cacheKey = await cacheKey(request.method, url.origin, path, url.search, body);
       const cacheReq = new Request(cacheKey, { method: 'GET' });
       const commentKey = COMMENT.test(path.toLowerCase()) ? await getCommentKey(path, url.search) : '';
 
@@ -85,7 +85,7 @@ export default {
       ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
 
       if (commentKey) {
-        ctx.waitUntil(writeR2Text(env, r2CommentKey(commentKey), text));
+        ctx.waitUntil(writeR2Text(env, commentKey, text));
       }
 
       return withCacheTag(res, 'miss', 'origin');
@@ -140,7 +140,7 @@ async function sign(appId, ts, path, appSecret) {
 /**
  * Generate a stable cache key from method, path, query and POST body hash.
  */
-async function makeCacheKey(method, origin, path, search, body) {
+async function cacheKey(method, origin, path, search, body) {
   const qs = new URLSearchParams(search);
   qs.set('_m', method);
   if (method === 'POST') {
@@ -175,10 +175,10 @@ async function writeCache(cache, req, res) {
 }
 
 /**
- * Read the second-level R2 cache for comment payloads (simple version, no LRU, rely on R2 lifecycle for expiry).
+ * Read the second-level R2 cache for comment payloads.
  */
 async function readR2CommentCache(env, commentKey) {
-  const text = await readR2Text(env, r2CommentKey(commentKey));
+  const text = await readR2Text(env, commentKey);
   if (!text) {
     return null;
   }
@@ -220,7 +220,8 @@ async function checkRisk(env, req, path, body, search, bad) {
     return { blocked: true, status: 400, code: 'request_too_large', retryAfter: 0 };
   }
 
-  const key = r2RiskKey(await shaHex(finger(req, path)));
+  // build the R2 key for a per-fingerprint risk state file
+  const key = `${CFG.prefix.risk}${await shaHex(finger(req, path))}.json`;
   const nowTS = now();
   const state = await readRiskState(env, key);
 
@@ -348,35 +349,13 @@ function fail(status, code, extra) {
 }
 
 /**
- * Build the R2 object key for a cached comment payload.
- */
-function r2CommentKey(commentKey) {
-  return `${CFG.prefix.comment}${commentKey}.json`;
-}
-
-/**
- * Build the R2 key for a per-fingerprint risk state file.
- */
-function r2RiskKey(fingerprint) {
-  return `${CFG.prefix.risk}${fingerprint}.json`;
-}
-
-/**
- * Extract the episode id from /api/v2/comment/{id}.
- */
-function getCommentId(path) {
-  return path.slice(path.lastIndexOf('/') + 1);
-}
-
-/**
  * Build a stable comment cache key from the episode id and query string.
  */
 async function getCommentKey(path, search) {
-  const commentId = getCommentId(path);
-  if (!search) {
-    return commentId;
-  }
-  return `${commentId}-${await shaHex(search)}`;
+  // extract the episode id from /api/v2/comment/{episodeId}
+  const episodeId = path.slice(path.lastIndexOf('/') + 1);
+  const key = search ? `${episodeId}-${await shaHex(search)}` : episodeId;
+  return `${CFG.prefix.comment}${key}.json`;
 }
 
 /**
@@ -419,17 +398,6 @@ function writeR2Text(env, key, text) {
       cacheControl: 'public, max-age=86400'
     }
   });
-}
-
-/**
- * Delete one or more objects from R2.
- */
-async function deleteR2Objects(env, keys) {
-  const list = Array.isArray(keys) ? keys.filter(Boolean) : [keys].filter(Boolean);
-  if (!list.length) {
-    return;
-  }
-  await getR2Bucket(env).delete(list);
 }
 
 /**
