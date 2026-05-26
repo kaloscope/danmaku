@@ -2,11 +2,11 @@ import { getStore } from '@edgeone/pages-blob';
 
 // Global runtime settings for upstream proxying, caching and risk control.
 const CFG = {
-  baseUrl: 'https://api.dandanplay.net',
-  cacheNs: 'danmaku_proxy_l1',
+  baseURL: 'https://api.dandanplay.net',
+  cacheName: 'danmaku_proxy_l1',
   cacheMax: 256,
   cacheTTL: 300,
-  blobName: 'danmaku-proxy-cache',
+  blobName: 'danmaku_proxy_l2',
   blobMax: 128,
   blobTTL: 86400,
   KV: {
@@ -68,7 +68,7 @@ export default async function onRequest(ctx) {
       return fail(risk.status, risk.code, { retryAfter: risk.retryAfter || 0 });
     }
 
-    const cache = await caches.open(CFG.cacheNs);
+    const cache = await caches.open(CFG.cacheName);
     const cacheKey = await makeCacheKey(req.method, path, requestURL.search, body);
     const cacheReq = new Request(cacheKey, { method: 'GET' });
 
@@ -136,7 +136,7 @@ async function proxy(req, path, search, body, env) {
     headers.set('Content-Type', type);
   }
 
-  return fetch(`${CFG.baseUrl}${path}${search}`, {
+  return fetch(`${CFG.baseURL}${path}${search}`, {
     method: req.method,
     headers,
     body: req.method === 'POST' ? body : undefined
