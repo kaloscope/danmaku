@@ -64,15 +64,15 @@ export default async function onRequest(ctx) {
     const cache = await caches.open(CFG.cacheName);
     const cacheKey = await makeCacheKey(req.method, path, url.search, body);
     const cacheReq = new Request(cacheKey, { method: 'GET' });
-    const commentId = COMMENT.test(path) ? getCommentId(path) : '';
+    const commentKey = COMMENT.test(path) ? await getCommentKey(path, url.search) : '';
 
     const l1 = await readCache(cache, cacheReq);
     if (l1) {
       return withCacheTag(l1, 'hit', 'l1');
     }
 
-    if (commentId) {
-      const l2 = await readBlobCache(commentId);
+    if (commentKey) {
+      const l2 = await readBlobCache(commentKey);
       if (l2) {
         ctx.waitUntil(writeCache(cache, cacheReq, l2.clone()));
         return withCacheTag(l2, 'hit', 'l2');
@@ -93,8 +93,8 @@ export default async function onRequest(ctx) {
 
     ctx.waitUntil(writeCache(cache, cacheReq, res.clone()));
 
-    if (commentId) {
-      ctx.waitUntil(writeBlobCache(commentId, text));
+    if (commentKey) {
+      ctx.waitUntil(writeBlobCache(commentKey, text));
     }
 
     return withCacheTag(res, 'miss', 'origin');
@@ -185,24 +185,24 @@ async function writeCache(cache, req, res) {
 /**
  * Read the second-level Blob cache for comment payloads.
  */
-async function readBlobCache(commentId) {
+async function readBlobCache(commentKey) {
   const nowTS = now();
   let list = await readMetaJSON(CFG.key.blobIndex, []);
-  const hit = list.find((item) => item.k === commentId);
+  const hit = list.find((item) => item.k === commentKey);
 
   if (!hit) {
     return null;
   }
 
   if (hit.e <= nowTS) {
-    list = list.filter((item) => item.k !== commentId);
-    await Promise.all([blob.delete(blobKey(commentId)), writeMetaJSON(CFG.key.blobIndex, list)]);
+    list = list.filter((item) => item.k !== commentKey);
+    await Promise.all([blob.delete(blobKey(commentKey)), writeMetaJSON(CFG.key.blobIndex, list)]);
     return null;
   }
 
-  const text = await blob.get(blobKey(commentId));
+  const text = await blob.get(blobKey(commentKey));
   if (!text) {
-    list = list.filter((item) => item.k !== commentId);
+    list = list.filter((item) => item.k !== commentKey);
     await writeMetaJSON(CFG.key.blobIndex, list);
     return null;
   }
@@ -215,14 +215,14 @@ async function readBlobCache(commentId) {
 /**
  * Persist the comment payload in Blob and maintain its Blob-based LRU metadata.
  */
-async function writeBlobCache(commentId, text) {
+async function writeBlobCache(commentKey, text) {
   const nowTS = now();
   let list = await readMetaJSON(CFG.key.blobIndex, []);
 
-  await blob.set(blobKey(commentId), text);
+  await blob.set(blobKey(commentKey), text);
 
-  list = list.filter((item) => item.k !== commentId && item.e > nowTS);
-  list.push({ k: commentId, a: nowTS, e: nowTS + CFG.blobTTL });
+  list = list.filter((item) => item.k !== commentKey && item.e > nowTS);
+  list.push({ k: commentKey, a: nowTS, e: nowTS + CFG.blobTTL });
   list.sort((a, b) => a.a - b.a);
   const drop = list.splice(0, Math.max(0, list.length - CFG.blobMax));
 
@@ -253,7 +253,7 @@ async function checkRisk(req, path, body, search, bad) {
     return { blocked: true, status: 400, code: 'request_too_large', retryAfter: 0 };
   }
 
-  const key = riskKey(await finger(req, path));
+  const key = riskKey(await shaHex(finger(req, path)));
   const nowTS = now();
   const state = await readMetaJSON(key, { h: [], b: 0 });
 
@@ -295,9 +295,9 @@ async function checkRisk(req, path, body, search, bad) {
 }
 
 /**
- * Build a lightweight client fingerprint for KV-based rate limiting.
+ * Build a lightweight client fingerprint for Blob-based rate limiting.
  */
-async function finger(req, path) {
+function finger(req, path) {
   const ip = pickIp(req);
   const ua = req.headers.get('user-agent') || '';
   const lang = req.headers.get('accept-language') || '';
@@ -339,7 +339,6 @@ function isJSON(text) {
     return false;
   }
 }
-
 
 /**
  * Create a JSON response with cache headers.
@@ -385,8 +384,8 @@ function fail(status, code, extra) {
 /**
  * Build the Blob object key for a cached comment payload.
  */
-function blobKey(commentId) {
-  return `${CFG.key.commentPrefix}${commentId}.json`;
+function blobKey(commentKey) {
+  return `${CFG.key.commentPrefix}${commentKey}.json`;
 }
 
 /**
@@ -401,6 +400,17 @@ function riskKey(fingerprint) {
  */
 function getCommentId(path) {
   return path.slice(path.lastIndexOf('/') + 1);
+}
+
+/**
+ * Build a stable comment cache key from the episode id and query string.
+ */
+async function getCommentKey(path, search) {
+  const commentId = getCommentId(path);
+  if (!search) {
+    return commentId;
+  }
+  return `${commentId}-${await shaHex(search)}`;
 }
 
 /**
