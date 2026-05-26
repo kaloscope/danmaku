@@ -1,55 +1,15 @@
 # danmaku
 
-Cloudflare Workers + R2 version of the danmaku proxy.
+这是一个基于 Cloudflare Workers 和 R2 的 [dandanplay API](https://api.dandanplay.net/swagger/index.html) 代理 Worker。
 
-## Structure
+## 项目结构
 
-- `src/index.js`: Worker entrypoint.
-- `wrangler.jsonc`: Worker and R2 binding configuration.
+- `src/index.js`：Worker 入口文件
+- `wrangler.jsonc`：Worker 与 R2 绑定配置
 
-## Features
+## 功能说明
 
-- Allowlisted proxy to `api.dandanplay.net`.
-- L1 cache via Cloudflare Cache API.
-- L2 cache via R2 for comment payloads and risk metadata.
-- Request risk control with per-fingerprint rate limiting.
-
-## Local development
-
-Install dependencies:
-
-```sh
-npm install
-```
-
-Create local secrets in `.dev.vars`:
-
-```dotenv
-APP_ID=your_app_id
-APP_SECRET=your_app_secret
-```
-
-Run the Worker locally:
-
-```sh
-npm run dev
-```
-
-## Deployment
-
-Create the R2 buckets referenced by `wrangler.jsonc`, or change the bucket names to match your existing setup.
-
-Set production secrets:
-
-```sh
-npx wrangler secret put APP_ID
-npx wrangler secret put APP_SECRET
-```
-
-Deploy:
-
-```sh
-npm run deploy
-```
-
-If you want to bind the Worker to a domain instead of `workers.dev`, add `route` or `routes` in `wrangler.jsonc`.
+- 仅代理白名单内的 API 请求
+- 使用 Cloudflare Cache API 作为一级缓存
+- 使用 R2 作为弹幕接口的二级缓存
+- 基于请求指纹实现风险控制与限流
