@@ -15,8 +15,7 @@
   "r2_buckets": [
     {
       "binding": "CACHE_BUCKET",
-      "bucket_name": "danmaku-proxy-cache",
-      "preview_bucket_name": "danmaku-proxy-cache-preview"
+      "bucket_name": "danmaku-proxy-cache"
     }
   ],
   "secrets": {
