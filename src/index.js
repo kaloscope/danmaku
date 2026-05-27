@@ -279,7 +279,7 @@ function pickIp(req) {
   const raw =
     req.headers.get('cf-connecting-ip') ||
     req.headers.get('x-forwarded-for') ||
-    req.headers.get('eo-client-ip') ||
+    req.headers.get('true-client-ip') ||
     'unknown';
   return raw.split(',')[0].trim();
 }
