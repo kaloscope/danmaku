@@ -1,6 +1,6 @@
 # Kaloscope Danmaku
 
-这是一个基于 Cloudflare Workers 和 R2 的 [dandanplay API](https://api.dandanplay.net/swagger/index.html) 代理服务。
+这是一个基于 Cloudflare Workers 构建，并使用 Cloudflare R2 对象存储缓存响应的 [dandanplay API](https://api.dandanplay.net/swagger/index.html) 代理服务。
 
 ## 项目结构
 
