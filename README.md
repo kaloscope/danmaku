@@ -1,4 +1,4 @@
-# Danmaku
+# Kaloscope Danmaku
 
 这是一个基于 Cloudflare Workers 和 R2 的 [dandanplay API](https://api.dandanplay.net/swagger/index.html) 代理服务。
 
